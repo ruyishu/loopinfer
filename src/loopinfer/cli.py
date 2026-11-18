@@ -10,6 +10,7 @@ import torch
 
 from . import __version__
 from .bench import run
+from .chat import DEFAULT_TEMPLATES
 from .engine import Engine, Sampling
 from .loading import BUILTINS, resolve_device
 
@@ -25,6 +26,11 @@ def model_options(parser):
     parser.add_argument("--kv-mib", type=float)
     parser.add_argument("--max-batch", type=int, default=8)
     parser.add_argument("--prefill-chunk", type=int, default=128)
+    parser.add_argument("--cuda-graph", dest="cuda_graph", action="store_true", default="auto")
+    parser.add_argument("--no-cuda-graph", dest="cuda_graph", action="store_false")
+    parser.add_argument("--graph-budget", type=int, default=32, help="Maximum captured CUDA graphs kept cached")
+    parser.add_argument("--attention", choices=["auto", "sdpa", "triton"], default="auto",
+                        help="Decode attention backend; auto uses the paged Triton kernel on CUDA")
 
 
 def parser():
@@ -49,6 +55,9 @@ def parser():
     serve.add_argument("--timeout", type=float, default=120)
     serve.add_argument("--queue-size", type=int, default=128)
     serve.add_argument("--stream-buffer", type=int, default=64)
+    serve.add_argument("--chat-template", type=Path, help="Jinja template file for /v1/chat/completions")
+    serve.add_argument("--default-chat-template", choices=sorted(DEFAULT_TEMPLATES),
+                       help="Built-in template for /v1/chat/completions when the checkpoint ships none")
     benchmark = sub.add_parser("bench", help="Run a concurrent streaming benchmark")
     benchmark.add_argument("--url", default="http://localhost:8000")
     benchmark.add_argument("--model")
@@ -93,7 +102,8 @@ def main(argv=None):
             return int(bool(report["errors"]))
         engine_params = {
             key: getattr(options, key) for key in (
-                "revision", "loops", "device", "dtype", "context", "page_size", "kv_mib", "max_batch", "prefill_chunk",
+                "revision", "loops", "device", "dtype", "context", "page_size", "kv_mib", "max_batch",
+                "prefill_chunk", "cuda_graph", "graph_budget", "attention",
             )
         }
         if options.command == "serve":
@@ -107,7 +117,11 @@ def main(argv=None):
                 print(json.dumps([asdict(row) for row in engine.generate(options.prompt, sample)], ensure_ascii=False))
             else:
                 from .server import make_server
-                with make_server(engine, options.host, options.port, timeout=options.timeout) as server:
+                template = options.chat_template.read_text(encoding="utf-8") if options.chat_template else None
+                with make_server(
+                    engine, options.host, options.port, timeout=options.timeout, chat_template=template,
+                    default_chat_template=options.default_chat_template,
+                ) as server:
                     logging.info("Serving %s at http://%s:%d", options.model, *server.server_address)
                     server.serve_forever()
         return 0

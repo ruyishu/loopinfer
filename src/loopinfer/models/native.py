@@ -68,6 +68,9 @@ class Attention(nn.Module):
         value = self.v_proj(hidden).reshape(shape).transpose(1, 2)
         if write:
             pool.write(domain, layer, batch, key, value)
+            attended = pool.decode_attention(domain, layer, query, batch, self.groups)
+            if attended is not None:
+                return self.o_proj(attended.transpose(1, 2).reshape(*hidden.shape[:2], -1))
         keys, values = pool.read(domain, layer, batch)
         mask = batch.causal
         if not write:

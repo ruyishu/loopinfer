@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -91,7 +92,8 @@ def test_mixed_batch_matches_individual(checkpoint):
     with Engine(str(checkpoint), max_batch=4, **opts) as engine:
         actual = engine.generate(list(reversed(texts)), sample)
         assert [r.token_ids for r in expected] == [r.token_ids for r in reversed(actual)]
-        assert engine.stats()["kv_pages_used"] == engine.stats()["kv_pages_reserved"] == 0
+        assert engine.stats()["kv_pages_used"] == 0
+        assert engine.stats()["kv_pages_free"] == engine.stats()["kv_pages_total"]
         with pytest.raises(ValueError, match="context limit"):
             engine.submit([3] * 13, sample)
 
@@ -113,5 +115,41 @@ def test_budget_and_slow_stream_do_not_strand_worker(checkpoint):
         handle = engine.submit("a b", Sampling(max_tokens=5, ignore_eos=True), stream=True)
         with pytest.raises(RuntimeError, match="fell behind"):
             handle.wait(5)
-        assert engine.stats()["kv_pages_reserved"] == 0
+        assert engine.stats()["kv_pages_used"] == 0
         assert engine.generate("a", Sampling(max_tokens=2, ignore_eos=True)).finish_reason == "length"
+
+
+def test_logprobs_and_stop_strings(checkpoint):
+    with Engine(str(checkpoint), device="cpu", context=16, page_size=2) as engine:
+        plain = engine.generate("a b", Sampling(max_tokens=6, ignore_eos=True))
+        assert plain.finish_reason == "length"
+        scored = engine.generate("a b", Sampling(max_tokens=6, ignore_eos=True, logprobs=2))
+        assert scored.token_ids == plain.token_ids
+        assert len(scored.logprobs) == 6
+        assert all(logprob <= 0 for logprob, _ in scored.logprobs)
+        assert all(len(top) == 2 for _, top in scored.logprobs)
+
+        # Stop strings are matched against decoded text, not against tokens.
+        request = SimpleNamespace(output=[3, 4, 5], stopped_text=None, sampling=Sampling(stop=("b",)))
+        assert engine.tokenizer.decode(request.output) == "a b c"
+        assert engine._stop_hit(request) == "stop"
+        assert request.stopped_text == "a "
+        assert engine._stop_hit(SimpleNamespace(output=[3], stopped_text=None,
+                                                sampling=Sampling(stop=("b",)))) is None
+
+
+def test_preemption_keeps_both_requests_complete(checkpoint):
+    loaded = load_model(str(checkpoint), device="cpu")
+    page_size = 2
+    capacity = 3 + 6 - 1
+    pages = -(-capacity // page_size)
+    page_bytes = page_size * loaded.model.cache_spec.token_bytes(loaded.dtype)
+    with Engine(str(checkpoint), device="cpu", context=capacity, page_size=page_size,
+                kv_mib=pages * page_bytes / 1024**2, max_batch=2) as engine:
+        sample = Sampling(max_tokens=6, ignore_eos=True)
+        first = engine.submit("a b c", sample)
+        second = engine.submit("a b c", sample)
+        assert len(first.wait(30).token_ids) == 6
+        assert len(second.wait(30).token_ids) == 6
+        assert engine.stats()["preemptions"] >= 1
+        assert engine.stats()["kv_pages_used"] == 0

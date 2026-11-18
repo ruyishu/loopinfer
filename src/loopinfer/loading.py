@@ -22,6 +22,7 @@ class LoadedModel:
     eos: frozenset[int]
     device: torch.device
     dtype: torch.dtype
+    chat_template: str | None = None
 
 
 def resolve_device(device: str) -> torch.device:
@@ -89,7 +90,8 @@ def load_model(name: str, *, revision=None, loops=None, device="auto", dtype="au
     if not folder.is_dir():
         folder = Path(snapshot_download(
             name, revision=revision,
-            allow_patterns=["config.json", "generation_config.json", "tokenizer.json", "*.safetensors", "*.safetensors.index.json"],
+            allow_patterns=["config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
+                            "*.safetensors", "*.safetensors.index.json"],
         ))
     config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
     target = resolve_device(device)
@@ -123,4 +125,13 @@ def load_model(name: str, *, revision=None, loops=None, device="auto", dtype="au
         raise ValueError("Invalid EOS token ID")
     if bos is not None and (not isinstance(bos, int) or not 0 <= bos < model.vocab_size):
         raise ValueError("Invalid BOS token ID")
-    return LoadedModel(model.eval(), tokenizer, str(name), bos, ends, target, precision)
+    chat_template = None
+    settings_file = folder / "tokenizer_config.json"
+    if settings_file.is_file():
+        settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        template = settings.get("chat_template")
+        if isinstance(template, dict):
+            template = template.get("default")
+        if isinstance(template, str) and template.strip():
+            chat_template = template
+    return LoadedModel(model.eval(), tokenizer, str(name), bos, ends, target, precision, chat_template)

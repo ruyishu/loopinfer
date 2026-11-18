@@ -37,7 +37,6 @@ curl -N http://127.0.0.1:8000/v1/completions \
 ~~~
 
 The same endpoint works with the OpenAI Python client.
-
 ~~~python
 from openai import OpenAI
 
@@ -50,12 +49,21 @@ for chunk in client.completions.create(
 
 | Endpoint | Interface |
 | --- | --- |
-| `POST /v1/completions` | One string prompt or one array of token IDs, `n=1`, greedy or sampled generation, streaming SSE and non-streaming JSON |
+| `POST /v1/completions` | String prompt or token IDs, `n` choices, greedy or sampled, `stop`, `logprobs`, streaming SSE and non-streaming JSON |
+| `POST /v1/chat/completions` | OpenAI chat messages rendered through the checkpoint's `chat_template` (or `--chat-template`/`--default-chat-template chatml`), with `logprobs` and `top_logprobs` |
 | `GET /v1/models` | Model currently loaded by this instance |
 | `GET /health`, `GET /ready` | HTTP liveness and inference-worker readiness |
-| `GET /metrics` | Queue, completions, generated tokens and KV page occupancy |
+| `GET /metrics` | Queue, completions, KV page occupancy, preemptions, CUDA graph counters and per-phase step timing |
 
-Completion parameters include `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stream` and `ignore_eos`. Unsupported parameters return HTTP 400. Queue overload returns HTTP 503. The server binds loopback by default. Chat templating, tool calls, TLS and request authentication are outside this server's interface.
+Completion parameters include `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stream`, `n`, `stop`, `logprobs` and `ignore_eos`. Chat adds `messages` and `top_logprobs`. Unsupported parameters return HTTP 400. Queue overload returns HTTP 503. The server binds loopback by default. Tool calls, TLS and request authentication are outside this server's interface.
+
+`GET /metrics` reports `step_ms_prepare`, `step_ms_forward`, `step_ms_sample`, `step_ms_commit` and `step_ms_step` alongside the counters. `sample` includes the device-to-host read of the logits, so it absorbs the GPU time that a launch-only timer would miss.
+
+## CUDA graphs
+
+Decode steps are captured as CUDA graphs keyed by `(batch size, history bucket)`, so one replay runs every layer of every round with a single launch. This removes the per-token Python dispatch that dominates small-batch decoding: on Ouro-1.4B over an NVIDIA H20 the served decode path went from 13.3 to 48.4 output tokens/s at concurrency 1 (3.6x) with byte-identical greedy outputs. Graphs are enabled by default on CUDA; pass `--no-cuda-graph` or `Engine(..., cuda_graph=False)` to measure the eager path, and read `cuda_graph_captures` / `cuda_graph_replays` from `stats()`. Capture happens lazily on first use, so the first request for a new shape pays a short one-off cost. `--graph-budget` bounds how many captured graphs stay cached; eviction is FIFO and counts in `cuda_graph_evictions`.
+
+A step is split into a prefill sub-batch and a decode sub-batch. Previously any request starting prefill sent the whole batch down the eager path, so every decoder in the batch lost its graph replay for that step.
 
 For offline batched use, all inputs share a scheduler.
 
@@ -84,7 +92,9 @@ python tools/export_dense_to_loop.py /path/to/run/last.pt ./loop-checkpoint
 loopinfer serve ./loop-checkpoint --device cuda --loops 2
 ~~~
 
-The scheduler packs visible decode and prefill work while reserving enough pages for admitted requests to finish. A single worker owns device execution and page reclamation. Attention gathers referenced KV pages into a batched SDPA call. For Ouro-1.4B BF16 with four loops, the raw KV cost is about 0.75 MiB per cached input position. `--kv-mib`, `--context`, `--max-batch` and `--prefill-chunk` tune the capacity and transient workspace.
+The scheduler packs prefill and decode into separate sub-batches of the same step. Pages are handed out as a request's cached length grows; when the pool runs dry the newest restarted-friendly request is preempted, put back at the head of the queue and re-run from its prompt, and admission stays closed until some request finishes so the engine cannot thrash. A single worker owns device execution and page reclamation. Attention gathers referenced KV pages into a batched SDPA call by default; `--attention triton` selects the experimental paged-attention kernel, which currently matches SDPA numerically but runs slower, so `auto` keeps the reference path. For Ouro-1.4B BF16 with four loops, the raw KV cost is about 0.75 MiB per cached input position. `--kv-mib`, `--context`, `--max-batch` and `--prefill-chunk` tune the capacity and transient workspace.
+
+Per-step page tables and the causal mask are built on the device from a padded table, so only per-row scalars cross PCIe. Building them on the host costs O(batch x history) Python work per step and dominates at long contexts.
 
 ## Verify and benchmark
 
@@ -95,7 +105,7 @@ loopinfer bench --url http://127.0.0.1:8000 --input-tokens 512 \
   --output-tokens 128 --concurrency 8 --requests 96 --output l20.json
 ~~~
 
-The synthetic benchmark forces a fixed output length and reports successful throughput, P50/P95 client-observed time to first token and inter-token delay, plus failures. Keep checkpoint revision, loop count, readout, dtype, hardware, initial context length and output budget fixed across engines.
+The synthetic benchmark forces a fixed output length and reports successful throughput, P50/P95 client-observed time to first token and inter-token delay, plus failures. `eval/inprocess.py` replays the same request mix through `Engine.submit` without HTTP, so the difference between the two answers what the serving layer costs; on H20 at 32 input and 32 output tokens that difference is 0% at concurrency 1 and 6-8% at concurrency 4-8, and each step reports its prepare/forward/sample/commit split. Keep checkpoint revision, loop count, readout, dtype, hardware, initial context length and output budget fixed across engines.
 
 Use the official Ouro forward implementation as an independent real-checkpoint reference in a separate environment or with the reference extra. This verifier loads reviewed official model code, forces the same reference token at each step, and reports logprob differences and greedy token agreement.
 
