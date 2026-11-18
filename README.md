@@ -19,6 +19,14 @@ Install without a checkout using `pip install 'loopinfer @ git+https://github.co
 
 CPU is useful for smaller checkpoints and tests. Use `--device cpu --dtype float32 --kv-mib 64` with a short prompt if trying the real Ouro checkpoint without a GPU. Local smoke tests run on CPU using small generated checkpoints. Linux NVIDIA L20 and A800 are the target GPUs. Real-checkpoint accuracy, memory and performance on them require the validation runs below.
 
+Try the installed CLI without downloading weights. This fixture uses random weights and is for runtime verification.
+
+~~~bash
+python examples/make_tiny_checkpoint.py ./tiny-ouro
+loopinfer generate ./tiny-ouro --device cpu --prompt "the cat sat" --max-tokens 4
+loopinfer serve ./tiny-ouro --device cpu --port 8000
+~~~
+
 ## Serve
 
 ~~~bash
