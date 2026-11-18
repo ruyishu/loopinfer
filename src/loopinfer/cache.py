@@ -35,6 +35,15 @@ class CacheBatch:
     lengths: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class RoundBatch:
+    groups: list
+
+    @property
+    def sizes(self):
+        return [len(rows) for _, _, rows in self.groups]
+
+
 @dataclass
 class StepBuffers:
     """Reusable device tensors for one forward pass.
@@ -82,7 +91,8 @@ class PagePool:
             device=device, dtype=dtype,
         )
         self.free = deque(range(pages))
-        self.owners: dict[int, int] = {}
+        self.owners: dict[int, set[int]] = {}
+        self.flash = None
         self.peak = 0
         self.use_kernel = False
 
@@ -106,7 +116,7 @@ class PagePool:
             if not self.free:
                 raise PoolExhausted(f"KV pool holds {self.pages} pages, all {self.used} in use")
             page = self.free.popleft()
-            self.owners[page] = request
+            self.owners[page] = {request}
             table.append(page)
             added += 1
         if added:
@@ -115,10 +125,18 @@ class PagePool:
 
     def release(self, request: int, table: list[int]) -> None:
         for page in table:
-            if self.owners.pop(page) != request:
-                raise RuntimeError("KV page owner mismatch")
-            self.free.append(page)
+            self.drop(request, page)
         table.clear()
+
+    def retain(self, request, page):
+        self.owners[page].add(request)
+
+    def drop(self, request, page):
+        owners = self.owners[page]
+        owners.remove(request)
+        if not owners:
+            del self.owners[page]
+            self.free.append(page)
 
     def make_buffers(self, batch: int, width: int, history: int) -> StepBuffers:
         device = self.device
@@ -139,6 +157,8 @@ class PagePool:
     def prepare(self, tables, starts, lengths, emit_rows) -> CacheBatch:
         """Allocate exact-size buffers for a one-off pass (used by tests and eager prefill)."""
         batch, width = len(tables), max(lengths)
+        if self.flash is not None:
+            return self.flash.prepare(tables, starts, lengths, emit_rows)
         buffers = self.make_buffers(batch, width, max(a + b for a, b in zip(starts, lengths)))
         return self.prepare_into(buffers, [[0] * width for _ in range(batch)], tables, starts, lengths, emit_rows)
 
@@ -160,10 +180,10 @@ class PagePool:
 
         write_slots, write_rows, write_cols = [], [], []
         for row, (table, start, length) in enumerate(zip(tables, starts, lengths)):
-            slots = pages_to_slots(table, page)
-            if length and len(slots) < start + length:
+            positions = np.arange(start, start + length, dtype=np.int64)
+            if length and len(table) * page < start + length:
                 raise RuntimeError("Page table does not cover the written positions")
-            write_slots.append(slots[start:start + length])
+            write_slots.append(np.asarray(table, dtype=np.int64)[positions // page] * page + positions % page)
             write_rows.append(np.full(length, row, dtype=np.int64))
             write_cols.append(np.arange(length, dtype=np.int64))
         written = int(sum(lengths))
@@ -213,6 +233,8 @@ class PagePool:
 
     def decode_attention(self, domain, layer, query, batch, groups):
         """Paged decode attention; None when this step or backend cannot use the kernel."""
+        if self.flash is not None:
+            return self.flash.run(domain, layer, query, batch)
         if not self.use_kernel or batch.positions.size(1) != 1 or batch.tables is None:
             return None
         from .kernels import paged_decode

@@ -1,0 +1,264 @@
+{
+  "repetitions": 3,
+  "seed": 2026,
+  "cases": [
+    {
+      "name": "short_decode",
+      "profile": "short-decode",
+      "concurrency": 1,
+      "requests": 100,
+      "workload": {
+        "vocab_size": 50000
+      }
+    },
+    {
+      "name": "long_prefill",
+      "profile": "long-prefill",
+      "concurrency": 1,
+      "requests": 100,
+      "workload": {
+        "vocab_size": 50000
+      }
+    },
+    {
+      "name": "long_decode",
+      "profile": "long-decode",
+      "concurrency": 1,
+      "requests": 100,
+      "workload": {
+        "vocab_size": 50000
+      }
+    },
+    {
+      "name": "mixed_load",
+      "profile": "mixed",
+      "concurrency": 8,
+      "workload": {
+        "vocab_size": 50000,
+        "request_rate": 4
+      },
+      "requests": 100
+    },
+    {
+      "name": "depth_50_50",
+      "profile": "mixed-depth",
+      "concurrency": 8,
+      "workload": {
+        "vocab_size": 50000,
+        "request_rate": 4
+      },
+      "requests": 100
+    },
+    {
+      "name": "depth_20_80",
+      "profile": "mixed-depth",
+      "concurrency": 8,
+      "workload": {
+        "vocab_size": 50000,
+        "short_depth_fraction": 0.2,
+        "request_rate": 4
+      },
+      "requests": 100
+    },
+    {
+      "name": "depth_80_20",
+      "profile": "mixed-depth",
+      "concurrency": 8,
+      "workload": {
+        "vocab_size": 50000,
+        "short_depth_fraction": 0.8,
+        "request_rate": 4
+      },
+      "requests": 100
+    },
+    {
+      "name": "shared_2k",
+      "profile": "long-decode",
+      "concurrency": 8,
+      "workload": {
+        "vocab_size": 50000,
+        "shared_prefix": 1536
+      },
+      "requests": 100
+    }
+  ],
+  "engines": [
+    {
+      "name": "sdpa_bucket",
+      "url": "http://127.0.0.1:8000",
+      "protocol": "loopinfer",
+      "command": [
+        "loopinfer",
+        "serve",
+        "ByteDance/Ouro-1.4B",
+        "--device",
+        "cuda",
+        "--dtype",
+        "bfloat16",
+        "--loops",
+        "4",
+        "--context",
+        "2304",
+        "--kv-mib",
+        "16384",
+        "--port",
+        "8000",
+        "--scheduler",
+        "bucket"
+      ],
+      "cases": [
+        "short_decode",
+        "long_prefill",
+        "long_decode",
+        "mixed_load",
+        "depth_50_50",
+        "depth_20_80",
+        "depth_80_20",
+        "shared_2k"
+      ]
+    },
+    {
+      "name": "sdpa_round",
+      "url": "http://127.0.0.1:8000",
+      "protocol": "loopinfer",
+      "command": [
+        "loopinfer",
+        "serve",
+        "ByteDance/Ouro-1.4B",
+        "--device",
+        "cuda",
+        "--dtype",
+        "bfloat16",
+        "--loops",
+        "4",
+        "--context",
+        "2304",
+        "--kv-mib",
+        "16384",
+        "--port",
+        "8000",
+        "--scheduler",
+        "round"
+      ],
+      "cases": [
+        "depth_50_50",
+        "depth_20_80",
+        "depth_80_20"
+      ]
+    },
+    {
+      "name": "flashinfer",
+      "url": "http://127.0.0.1:8000",
+      "protocol": "loopinfer",
+      "command": [
+        "loopinfer",
+        "serve",
+        "ByteDance/Ouro-1.4B",
+        "--device",
+        "cuda",
+        "--dtype",
+        "bfloat16",
+        "--loops",
+        "4",
+        "--context",
+        "2304",
+        "--kv-mib",
+        "16384",
+        "--port",
+        "8000",
+        "--attention",
+        "flashinfer"
+      ],
+      "cases": [
+        "short_decode",
+        "long_prefill",
+        "long_decode",
+        "mixed_load"
+      ]
+    },
+    {
+      "name": "packed",
+      "url": "http://127.0.0.1:8000",
+      "protocol": "loopinfer",
+      "command": [
+        "loopinfer",
+        "serve",
+        "ByteDance/Ouro-1.4B",
+        "--device",
+        "cuda",
+        "--dtype",
+        "bfloat16",
+        "--loops",
+        "4",
+        "--context",
+        "2304",
+        "--kv-mib",
+        "16384",
+        "--port",
+        "8000",
+        "--fuse-projections"
+      ],
+      "cases": [
+        "short_decode",
+        "long_prefill",
+        "long_decode",
+        "mixed_load"
+      ]
+    },
+    {
+      "name": "prefix",
+      "url": "http://127.0.0.1:8000",
+      "protocol": "loopinfer",
+      "command": [
+        "loopinfer",
+        "serve",
+        "ByteDance/Ouro-1.4B",
+        "--device",
+        "cuda",
+        "--dtype",
+        "bfloat16",
+        "--loops",
+        "4",
+        "--context",
+        "2304",
+        "--kv-mib",
+        "16384",
+        "--port",
+        "8000",
+        "--prefix-cache-pages",
+        "512"
+      ],
+      "cases": [
+        "shared_2k"
+      ]
+    },
+    {
+      "name": "speculate",
+      "url": "http://127.0.0.1:8000",
+      "protocol": "loopinfer",
+      "command": [
+        "loopinfer",
+        "serve",
+        "ByteDance/Ouro-1.4B",
+        "--device",
+        "cuda",
+        "--dtype",
+        "bfloat16",
+        "--loops",
+        "4",
+        "--context",
+        "2304",
+        "--kv-mib",
+        "16384",
+        "--port",
+        "8000",
+        "--speculate-tokens",
+        "4"
+      ],
+      "cases": [
+        "short_decode",
+        "long_decode"
+      ]
+    }
+  ]
+}

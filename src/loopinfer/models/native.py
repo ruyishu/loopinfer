@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ..cache import CacheSpec
+from ..cache import CacheSpec, RoundBatch
 
 
 class RMSNorm(nn.Module):
@@ -38,6 +38,15 @@ def rotate(hidden, rope):
     return hidden * rope[0] + torch.cat((-right, left), dim=-1) * rope[1]
 
 
+def concatenate_projections(*layers):
+    """Pack fixed weights once, keeping the original checkpoint names loadable."""
+    packed = nn.Linear(layers[0].in_features, sum(layer.out_features for layer in layers),
+                       bias=False, device="meta")
+    packed.weight = nn.Parameter(torch.cat([layer.weight for layer in layers]), requires_grad=False)
+    sizes = [layer.out_features for layer in layers]
+    return packed, sizes
+
+
 class MLP(nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -45,8 +54,16 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(model.width, model.intermediate_size, bias=False)
         self.down_proj = nn.Linear(model.intermediate_size, model.width, bias=False)
 
+    def pack(self):
+        self.packed, self.packed_sizes = concatenate_projections(self.gate_proj, self.up_proj)
+        del self.gate_proj, self.up_proj
+
     def forward(self, hidden):
-        return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        if hasattr(self, "packed"):
+            gate, up = self.packed(hidden).split(self.packed_sizes, dim=-1)
+        else:
+            gate, up = self.gate_proj(hidden), self.up_proj(hidden)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class Attention(nn.Module):
@@ -61,29 +78,48 @@ class Attention(nn.Module):
         self.k_norm = nn.Identity() if ouro else RMSNorm(self.dim, model.eps)
         self.groups = model.heads // model.kv_heads
 
+    def pack(self):
+        self.packed, self.packed_sizes = concatenate_projections(self.q_proj, self.k_proj, self.v_proj)
+        del self.q_proj, self.k_proj, self.v_proj
+
     def forward(self, hidden, rope, pool, batch, domain, layer, write):
         shape = (*hidden.shape[:2], -1, self.dim)
-        query = rotate(self.q_norm(self.q_proj(hidden).reshape(shape)).transpose(1, 2), rope)
-        key = rotate(self.k_norm(self.k_proj(hidden).reshape(shape)).transpose(1, 2), rope)
-        value = self.v_proj(hidden).reshape(shape).transpose(1, 2)
+        if hasattr(self, "packed"):
+            q, k, v = self.packed(hidden).split(self.packed_sizes, dim=-1)
+        else:
+            q, k, v = self.q_proj(hidden), self.k_proj(hidden), self.v_proj(hidden)
+        query = rotate(self.q_norm(q.reshape(shape)).transpose(1, 2), rope)
+        key = rotate(self.k_norm(k.reshape(shape)).transpose(1, 2), rope)
+        value = v.reshape(shape).transpose(1, 2)
+        if isinstance(batch, RoundBatch):
+            parts = []
+            for (domain, group, rows), q, k, v in zip(
+                batch.groups, query.split(batch.sizes), key.split(batch.sizes), value.split(batch.sizes),
+            ):
+                parts.append(self.attend(q, k, v, pool, group, domain, layer, True))
+            attended = torch.cat(parts)
+        else:
+            attended = self.attend(query, key, value, pool, batch, domain, layer, write)
+        return self.o_proj(attended.transpose(1, 2).reshape(*hidden.shape[:2], -1))
+
+    def attend(self, query, key, value, pool, batch, domain, layer, write):
         if write:
             pool.write(domain, layer, batch, key, value)
             attended = pool.decode_attention(domain, layer, query, batch, self.groups)
             if attended is not None:
-                return self.o_proj(attended.transpose(1, 2).reshape(*hidden.shape[:2], -1))
+                return attended
         keys, values = pool.read(domain, layer, batch)
         mask = batch.causal
         if not write:
             # Each row sees only its own transient KV from this round.
             keys = torch.cat((keys, key), dim=2)
             values = torch.cat((values, value), dim=2)
-            self_mask = torch.eye(hidden.size(1), dtype=torch.bool, device=hidden.device)
+            self_mask = torch.eye(query.size(2), dtype=torch.bool, device=query.device)
             mask = torch.cat((mask, self_mask[None, None] & batch.valid[:, None, None]), dim=-1)
         if self.groups > 1:
             keys = keys.repeat_interleave(self.groups, dim=1)
             values = values.repeat_interleave(self.groups, dim=1)
-        attended = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
-        return self.o_proj(attended.transpose(1, 2).reshape(*hidden.shape[:2], -1))
+        return F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
 
 
 class DecoderLayer(nn.Module):
@@ -165,13 +201,52 @@ class Ouro(NativeModel):
         self.cache_spec = CacheSpec(self.loops, self.layer_count, self.kv_heads, self.head_dim)
 
     def forward(self, ids, batch, pool, *, trace=None):
+        return self.forward_depth(ids, batch, pool, self.loops, trace=trace)
+
+    def pack_projections(self):
+        for layer in self.model.layers:
+            if not hasattr(layer.self_attn, "packed"):
+                layer.self_attn.pack()
+                layer.mlp.pack()
+
+    def forward_depth(self, ids, batch, pool, loops, *, trace=None, threshold=None):
         hidden = self.model.embed_tokens(ids)
         rope = self.model.rotary(batch.positions, hidden.dtype)
-        for depth in range(self.loops):
+        states = []
+        for depth in range(loops):
             hidden = self.model.round(hidden, rope, pool, batch, depth)
+            if threshold is not None:
+                states.append(self.selected(hidden, batch))
             if trace is not None:
                 trace.append(self.selected(hidden, batch))
-        return self.lm_head(self.selected(hidden, batch)).float()
+        if threshold is None:
+            selected = self.selected(hidden, batch)
+        else:
+            selected = self.gate_readout(states, threshold)
+        return self.lm_head(selected).float()
+
+    def gate_readout(self, states, threshold):
+        # Ouro's public reference chooses a readout after building all KV domains.
+        remaining = torch.ones_like(states[0][:, 0])
+        probabilities = []
+        for state in states[:-1]:
+            hazard = self.model.early_exit_gate(state).squeeze(-1).sigmoid()
+            probabilities.append(remaining * hazard)
+            remaining = remaining * (1 - hazard)
+        probabilities.append(remaining)
+        eligible = torch.stack(probabilities, dim=1).cumsum(dim=1) >= threshold
+        exits = eligible.int().argmax(dim=1)
+        exits = torch.where(eligible.any(dim=1), exits, len(states) - 1)
+        ordered = torch.stack(states, dim=1)
+        return ordered[torch.arange(exits.numel(), device=exits.device), exits]
+
+
+    def decode_round(self, hidden, groups, pool):
+        """Share projections and MLPs across rows with different KV domains."""
+        batch = RoundBatch(groups)
+        positions = torch.cat([group.positions for _, group, _ in groups])
+        rope = self.model.rotary(positions, hidden.dtype)
+        return self.model.round(hidden, rope, pool, batch, None)
 
 
 class InputUpdater(nn.Module):

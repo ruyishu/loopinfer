@@ -30,8 +30,8 @@ def run_loopinfer(args):
     port = args.port
     log = (BASE / "logs" / "serve_perf.log").open("w")
     server = subprocess.Popen(
-        [PY, "-m", "loopinfer", "serve", str(MODEL), "--device", "cuda", "--loops", str(args.loops),
-         "--port", str(port), "--context", "512", "--max-batch", str(max(args.concurrency)),
+        [PY, "-m", "loopinfer", "serve", str(args.model), "--device", "cuda", "--loops", str(args.loops),
+         "--port", str(port), "--context", str(args.input_tokens + args.output_tokens - 1), "--max-batch", str(max(args.concurrency)),
          "--kv-mib", "3072"],
         cwd=BASE, env=env(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
     )
@@ -87,7 +87,7 @@ def run_hf(args):
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL, trust_remote_code=True, dtype=torch.bfloat16, attn_implementation="sdpa",
+        args.model, trust_remote_code=True, dtype=torch.bfloat16, attn_implementation="sdpa",
     ).to("cuda").eval()
 
     rows = []
@@ -95,20 +95,23 @@ def run_hf(args):
         prompt = torch.full((batch, args.input_tokens), 1, dtype=torch.long, device="cuda")
         with torch.inference_mode():
             for _ in range(args.repeats):
-                model(prompt, use_cache=True)  # warmup
+                model(prompt, use_cache=True, exit_at_step=args.loops - 1)  # warmup
             prefill = []
             for _ in range(args.repeats):
                 started = time.perf_counter()
-                model(prompt, use_cache=True)
+                model(prompt, use_cache=True, exit_at_step=args.loops - 1)
+                torch.cuda.synchronize()
                 prefill.append(time.perf_counter() - started)
-            generate = []
+            generate, generated = [], []
             for _ in range(args.repeats):
                 started = time.perf_counter()
-                model.generate(
+                result = model.generate(
                     prompt, max_new_tokens=args.output_tokens, do_sample=False,
-                    pad_token_id=0, eos_token_id=0, use_cache=True,
+                    pad_token_id=0, eos_token_id=None, use_cache=True, exit_at_step=args.loops - 1,
                 )
+                torch.cuda.synchronize()
                 generate.append(time.perf_counter() - started)
+                generated.append(batch * (result.shape[-1] - args.input_tokens))
         prefill.sort()
         generate.sort()
         median_generate = generate[len(generate) // 2]
@@ -118,7 +121,7 @@ def run_hf(args):
             "prefill_p50_ms": round(median_prefill * 1000, 1),
             "generate_p50_ms": round(median_generate * 1000, 1),
             "inter_token_p50_ms": round((median_generate - median_prefill) / max(1, args.output_tokens - 1) * 1000, 1),
-            "output_tokens_per_second": round(batch * args.output_tokens / median_generate, 2),
+            "output_tokens_per_second": round(sum(generated) / sum(generate), 2),
             "gpu_peak_mib": gpu_memory(),
         })
         print(json.dumps(rows[-1]), flush=True)
@@ -127,6 +130,7 @@ def run_hf(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default=str(MODEL), help="Local checkpoint or Hub model ID")
     parser.add_argument("--engine", choices=["loopinfer", "hf"], required=True)
     parser.add_argument("--input-tokens", type=int, default=32)
     parser.add_argument("--output-tokens", type=int, default=32)

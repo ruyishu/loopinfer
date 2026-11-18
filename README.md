@@ -1,6 +1,6 @@
 # LoopInfer
 
-LoopInfer is a standalone inference engine for recurrent-depth language models. It owns its model execution, scheduler, KV pages, and serving API. The runtime uses PyTorch SDPA and has no dependency on vLLM, SGLang, or DeepInfer.
+LoopInfer is a standalone inference engine for recurrent-depth language models. It owns its model execution, scheduler, KV pages, and serving API. The default runtime uses PyTorch SDPA. FlashInfer is an optional CUDA attention backend. Neither installing nor running LoopInfer requires vLLM, SGLang, or DeepInfer.
 
 ## Install and run
 
@@ -61,7 +61,7 @@ Completion parameters include `max_tokens`, `temperature`, `top_p`, `top_k`, `se
 
 ## CUDA graphs
 
-Decode steps are captured as CUDA graphs keyed by `(batch size, history bucket)`, so one replay runs every layer of every round with a single launch. This removes the per-token Python dispatch that dominates small-batch decoding: on Ouro-1.4B over an NVIDIA H20 the served decode path went from 13.3 to 48.4 output tokens/s at concurrency 1 (3.6x) with byte-identical greedy outputs. Graphs are enabled by default on CUDA; pass `--no-cuda-graph` or `Engine(..., cuda_graph=False)` to measure the eager path, and read `cuda_graph_captures` / `cuda_graph_replays` from `stats()`. Capture happens lazily on first use, so the first request for a new shape pays a short one-off cost. `--graph-budget` bounds how many captured graphs stay cached; eviction is FIFO and counts in `cuda_graph_evictions`.
+Decode steps are captured as CUDA graphs keyed by `(batch size, history bucket)`, so one replay runs every layer of every round with a single launch. This removes the per-token Python dispatch that dominates small-batch decoding: on Ouro-1.4B over an NVIDIA H20 the served decode path went from 13.3 to 48.4 output tokens/s at concurrency 1 (3.6x) with byte-identical greedy outputs. Graphs are enabled by default on CUDA; pass `--no-cuda-graph` or `Engine(..., cuda_graph=False)` to measure the eager path, and read `cuda_graph_captures` / `cuda_graph_replays` from `stats()`. Capture happens lazily on first use, so the first request for a new shape pays a short one-off cost. `--graph-budget` limits the number of captured graphs and `--graph-mib` limits their estimated live allocations. The graph key also includes request depth. FIFO evictions are counted in `cuda_graph_evictions`.
 
 A step is split into a prefill sub-batch and a decode sub-batch. Previously any request starting prefill sent the whole batch down the eager path, so every decoder in the batch lost its graph replay for that step.
 
@@ -82,7 +82,7 @@ Use `engine.submit(token_ids, sampling, stream=True)` to receive token events, a
 
 | Model type | Loops | KV layout and output |
 | --- | --- | --- |
-| `ouro` | Fixed, up to checkpoint depth | One cache domain per executed round. Normalize after every round and read out the final executed round. Ouro early exit and gate-weighted output require a separate execution path |
+| `ouro` | Fixed, up to checkpoint depth | One cache domain per executed round. Normalize after every round and read out the final executed round. Optional threshold-based readout retains full-depth KV |
 | `dense-to-loop` | Fixed, one or two | One persistent round-one domain. On round two, each query reads causal round-one history and its own current round-two KV. Average the two masked softmax distributions before sampling |
 
 The Ouro profile is for full attention and default RoPE. The native loader validates tensor shapes and tied aliases. Dense-to-loop accepts the original full training checkpoint after export, using its matching Qwen3 configuration and tokenizer.
@@ -92,7 +92,7 @@ python tools/export_dense_to_loop.py /path/to/run/last.pt ./loop-checkpoint
 loopinfer serve ./loop-checkpoint --device cuda --loops 2
 ~~~
 
-The scheduler packs prefill and decode into separate sub-batches of the same step. Pages are handed out as a request's cached length grows; when the pool runs dry the newest restarted-friendly request is preempted, put back at the head of the queue and re-run from its prompt, and admission stays closed until some request finishes so the engine cannot thrash. A single worker owns device execution and page reclamation. Attention gathers referenced KV pages into a batched SDPA call by default; `--attention triton` selects the experimental paged-attention kernel, which currently matches SDPA numerically but runs slower, so `auto` keeps the reference path. For Ouro-1.4B BF16 with four loops, the raw KV cost is about 0.75 MiB per cached input position. `--kv-mib`, `--context`, `--max-batch` and `--prefill-chunk` tune the capacity and transient workspace.
+The scheduler packs prefill and decode into separate sub-batches of the same step. Pages are handed out as a request's cached length grows; under pressure the scheduler first evicts cached prefixes. If it must preempt a live request, it replays the prompt and committed tokens to reconstruct KV. Sampling RNG and already delivered streaming events are preserved. A single worker owns device execution and page reclamation. Attention gathers referenced KV pages into a batched SDPA call by default; `--attention triton` selects the experimental paged-attention kernel, which currently matches SDPA numerically but runs slower, so `auto` keeps the reference path. For Ouro-1.4B BF16 with four loops, the raw KV cost is about 0.75 MiB per cached input position. `--kv-mib`, `--context`, `--max-batch` and `--prefill-chunk` tune the capacity and transient workspace.
 
 Per-step page tables and the causal mask are built on the device from a padded table, so only per-row scalars cross PCIe. Building them on the host costs O(batch x history) Python work per step and dominates at long contexts.
 
@@ -101,8 +101,8 @@ Per-step page tables and the causal mask are built on the device from a padded t
 ~~~bash
 python -m pip install '.[test]'
 python -m pytest -q
-loopinfer bench --url http://127.0.0.1:8000 --input-tokens 512 \
-  --output-tokens 128 --concurrency 8 --requests 96 --output l20.json
+loopinfer bench --url http://127.0.0.1:8000 --profile mixed --vocab-size 50000 \
+  --concurrency 8 --requests 100 --events-out events.jsonl --output l20.json
 ~~~
 
 The synthetic benchmark forces a fixed output length and reports successful throughput, P50/P95 client-observed time to first token and inter-token delay, plus failures. `eval/inprocess.py` replays the same request mix through `Engine.submit` without HTTP, so the difference between the two answers what the serving layer costs; on H20 at 32 input and 32 output tokens that difference is 0% at concurrency 1 and 6-8% at concurrency 4-8, and each step reports its prepare/forward/sample/commit split. Keep checkpoint revision, loop count, readout, dtype, hardware, initial context length and output budget fixed across engines.
@@ -119,7 +119,11 @@ python tools/verify_ouro.py --model ByteDance/Ouro-1.4B \
 
 The scheduler calls an adapter with token IDs, a batch of positions and page-table indices, and a page pool. An adapter provides `vocab_size`, `max_positions`, and `CacheSpec`, and returns one row of logits or log probabilities per emitting sequence. Adapter factories take `(config, loops)`. Weights are loaded from safetensors by parameter name. Register an external factory with the `loopinfer.models` Python package entry-point group and set the same key as `model_type` in the checkpoint. See the built-in Ouro and dense-to-loop adapters for two concrete layouts.
 
-The current scheduler uses continuous batching at the token boundary. DeepInfer's CPU/device overlap and validation methodology inform the design. The runtime keeps a synchronous execution path as the baseline for future loop-level scheduling, direct paged attention kernels and CUDA Graph experiments.
+Ouro requests can set `loop_depth` in an OpenAI-compatible request body or pass `Sampling(loop_depth=2)` to the Python engine. The server's `--loops` option sets the depth limit. `--scheduler bucket` groups equal depths and `--scheduler round` shares the projections and MLPs across compatible decode rows at different rounds while directing each row to its own KV domain. The default `auto` uses whole-token execution for a homogeneous decode batch and round scheduling when multiple depths are active. Optional `exit_threshold` selects a checkpoint-gated readout using all configured rounds, matching the public Ouro reference's full-cache policy.
+
+`--prefix-cache-pages N` caches complete immutable Ouro prompt pages. The Python API supports per-request `cache_namespace`. The HTTP service is single-tenant, so use distinct service instances across trust domains when enabling prefix caching. Keep the last prompt token for computing next-token logits. `--fuse-projections` packs Ouro QKV and MLP gate/up weights. `--speculate-tokens N` enables experimental single-row greedy draft verification in the SDPA path. Both are selectable per server. `--attention flashinfer` uses direct paged decode and packed attention for prefill, with eager planning and full KV history. Validate numeric parity for each backend and dtype on the deployment GPU.
+
+See [the CUDA validation and benchmark guide](eval/CUDA.md) for same-trace comparisons, CUDA profiling and container packaging.
 
 - [DeepInfer](https://github.com/deepseek-ai/DeepInfer)
 - [Ouro checkpoint and reference implementation](https://huggingface.co/ByteDance/Ouro-1.4B)

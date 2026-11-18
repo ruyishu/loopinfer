@@ -4,7 +4,7 @@ import httpx
 from openai import OpenAI
 
 from loopinfer import Engine
-from loopinfer.bench import run
+from loopinfer.bench import make_trace, replay, run
 from loopinfer.server import make_server
 
 
@@ -64,6 +64,12 @@ def test_openai_and_benchmark(checkpoint):
             report = run(root, None, 8, 4, 2, 3, token_id=3, warmup=1)
             assert report["completed"] == 3
             assert report["errors"] == []
+            assert report["tpot_p95_ms"] is not None
+            trace = make_trace("long-prefill", 2, input_tokens=8, request_rate=50, vocab_size=10)
+            report, events = replay(root, None, trace, 2, warmup=0)
+            assert report["completed"] == 2
+            assert report["tpot_p95_ms"] is None
+            assert all(row["output_tokens"] == 1 for row in events)
             metrics = httpx.get(root + "/metrics").text
             assert "loopinfer_kv_pages_used 0" in metrics
             assert "loopinfer_step_ms_forward" in metrics

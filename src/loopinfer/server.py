@@ -14,11 +14,11 @@ from .engine import Overloaded, Sampling
 LOGGER = logging.getLogger(__name__)
 COMPLETION_FIELDS = {
     "model", "prompt", "max_tokens", "temperature", "top_p", "top_k", "seed", "stream", "n", "ignore_eos",
-    "stop", "logprobs",
+    "stop", "logprobs", "loop_depth", "exit_threshold", "stream_options",
 }
 CHAT_FIELDS = {
     "model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "seed",
-    "stream", "n", "ignore_eos", "stop", "logprobs", "top_logprobs",
+    "stream", "n", "ignore_eos", "stop", "logprobs", "top_logprobs", "loop_depth", "exit_threshold",
 }
 
 
@@ -44,7 +44,8 @@ def _sampling(payload, *, max_tokens, logprobs):
     return Sampling(
         max_tokens=max_tokens, temperature=payload.get("temperature", 0.0), top_p=payload.get("top_p", 1.0),
         top_k=payload.get("top_k", 0), seed=payload.get("seed"), ignore_eos=payload.get("ignore_eos", False),
-        stop=_stops(payload.get("stop")), logprobs=logprobs,
+        stop=_stops(payload.get("stop")), logprobs=logprobs, loop_depth=payload.get("loop_depth"),
+        exit_threshold=payload.get("exit_threshold"),
     )
 
 
@@ -182,7 +183,9 @@ def make_server(engine, host, port, *, timeout=120.0, chat_template=None, defaul
             self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
-        def _chunk(self, kind, base, index, delta, reason, logprob=None):
+        def _chunk(self, kind, base, index, delta, reason, logprob=None, token_id=None):
+            if token_id is not None and self.headers.get("X-LoopInfer-Token-Ids") == "1":
+                base = {**base, "token_ids": [token_id]}
             if kind == "chat":
                 choice = {"index": index, "delta": delta if isinstance(delta, dict) else {"content": delta},
                           "finish_reason": reason}
@@ -193,12 +196,13 @@ def make_server(engine, host, port, *, timeout=120.0, chat_template=None, defaul
                     "choices": [{"index": index, "text": delta if isinstance(delta, str) else "",
                                  "logprobs": None, "finish_reason": reason}]}
 
-        def _events(self, entries, kind, base):
+        def _events(self, entries, kind, base, include_usage=False):
             """entries: [(handle, choice_index, sampling)]; streams are interleaved."""
             self._start_events()
             decoders = [DecodeStream(skip_special_tokens=True) for _ in entries]
             seen = [""] * len(entries)
             emitted = [0] * len(entries)
+            deadline = time.monotonic() + timeout
             holdback = [max((len(stop) for stop in sampling.stop), default=1) - 1 for _, _, sampling in entries]
             if kind == "chat":
                 for _, index, _ in entries:
@@ -207,6 +211,9 @@ def make_server(engine, host, port, *, timeout=120.0, chat_template=None, defaul
             finished_sent = [False] * len(entries)
             try:
                 while live:
+                    if time.monotonic() >= deadline:
+                        self._send({"error": {"message": "Generation timed out", "type": "server_error"}})
+                        break
                     idle = True
                     for slot in sorted(live):
                         handle, index, _ = entries[slot]
@@ -245,7 +252,7 @@ def make_server(engine, host, port, *, timeout=120.0, chat_template=None, defaul
                             finished_sent[slot] = True
                         self._send(self._chunk(
                             kind, base, index, {"content": piece} if kind == "chat" else piece,
-                            event.finish_reason, logprob,
+                            event.finish_reason, logprob, event.token_id,
                         ))
                     if idle:
                         time.sleep(0.002)
@@ -256,6 +263,13 @@ def make_server(engine, host, port, *, timeout=120.0, chat_template=None, defaul
             finally:
                 for slot in live:
                     entries[slot][0].cancel()
+            if include_usage and all(handle.result is not None for handle, _, _ in entries):
+                prompt_tokens = sum(handle.result.prompt_tokens for handle, _, _ in entries)
+                completion_tokens = sum(len(handle.result.token_ids) for handle, _, _ in entries)
+                self._send({**self._chunk(kind, base, 0, "", None), "choices": [], "usage": {
+                    "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                }})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 
@@ -265,7 +279,12 @@ def make_server(engine, host, port, *, timeout=120.0, chat_template=None, defaul
                 sample = sampling
                 if count > 1 and sampling.seed is not None:
                     sample = replace(sampling, seed=(sampling.seed + index) % 2**64)
-                handles.append(engine.submit(prompt, sample, stream=stream))
+                try:
+                    handles.append(engine.submit(prompt, sample, stream=stream))
+                except Exception:
+                    for handle in handles:
+                        handle.cancel()
+                    raise
             return handles
 
         def do_POST(self):
@@ -284,6 +303,11 @@ def make_server(engine, host, port, *, timeout=120.0, chat_template=None, defaul
                     parse_chat(payload, engine, chat_template, default_chat_template) if chat
                     else parse_completion(payload, engine)
                 )
+                stream_options = payload.get("stream_options") or {}
+                if (not isinstance(stream_options, dict) or stream_options.keys() - {"include_usage"}
+                        or type(stream_options.get("include_usage", False)) is not bool
+                        or (stream_options and not stream)):
+                    raise ValueError("stream_options.include_usage requires a streaming request")
                 handles = self._submit(source["prompt"], sampling, stream, count)
                 base = {
                     "id": f"{'chatcmpl' if chat else 'cmpl'}-{uuid.uuid4().hex}", "created": int(time.time()),
@@ -292,7 +316,7 @@ def make_server(engine, host, port, *, timeout=120.0, chat_template=None, defaul
                 if stream:
                     streaming_started = True
                     self._events([(handle, index, sampling) for index, handle in enumerate(handles)],
-                                 "chat" if chat else "completion", base)
+                                 "chat" if chat else "completion", base, stream_options.get("include_usage", False))
                     return
                 results = [handle.wait(timeout) for handle in handles]
                 usage = {

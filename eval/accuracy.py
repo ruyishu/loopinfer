@@ -5,9 +5,8 @@ import json
 import time
 from pathlib import Path
 
-from common import MODEL, RESULTS, build_prompt, env, load_gsm8k, parse_number, write_json
+from common import GSM8K, MODEL, RESULTS, build_prompt, load_gsm8k, parse_number, write_json
 
-env()
 
 
 def summarise(rows, elapsed, max_new):
@@ -29,22 +28,25 @@ def run_hf(items, args):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision, trust_remote_code=True)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL, trust_remote_code=True, dtype=torch.bfloat16, attn_implementation="sdpa",
-    ).to("cuda").eval()
+        args.model, revision=args.revision, trust_remote_code=True,
+        torch_dtype=getattr(torch, args.dtype), attn_implementation="sdpa",
+    ).to(args.device).eval()
 
     rows, started = [], time.perf_counter()
     for start in range(0, len(items), args.batch):
         chunk = items[start:start + args.batch]
         prompts = [build_prompt(tokenizer, item["question"]) for item in chunk]
-        encoded = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to("cuda")
+        encoded = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(args.device)
         with torch.inference_mode():
             output = model.generate(
-                **encoded, max_new_tokens=args.max_new, do_sample=False, pad_token_id=0, eos_token_id=0,
+                **encoded, max_new_tokens=args.max_new, do_sample=False, pad_token_id=tokenizer.pad_token_id,
+                exit_at_step=args.loops - 1 if args.exit_threshold is None else None,
+                exit_threshold=args.exit_threshold,
             )
         prompt_width = encoded["input_ids"].shape[1]
         for index, item in enumerate(chunk):
@@ -54,7 +56,7 @@ def run_hf(items, args):
             row = {
                 "engine": "hf", "index": start + index, "question": item["question"], "gold": item["gold"],
                 "predicted": predicted, "correct": predicted == item["gold"],
-                "tokens": int((new_tokens != 0).sum().item()), "text": text[-1200:],
+                "tokens": new_tokens.numel(), "text": text[-1200:],
             }
             rows.append(row)
             print(json.dumps({k: row[k] for k in ("index", "gold", "predicted", "correct")}), flush=True)
@@ -66,11 +68,17 @@ def run_loopinfer(items, args):
 
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision, trust_remote_code=True)
     prompts = [build_prompt(tokenizer, item["question"]) for item in items]
     started = time.perf_counter()
-    with Engine(str(MODEL), device="cuda", loops=args.loops, context=512, max_batch=args.batch) as engine:
-        results = engine.generate(prompts, Sampling(max_tokens=args.max_new, temperature=0.0))
+    with Engine(args.model, revision=args.revision, device=args.device, dtype=args.dtype, loops=args.loops,
+                context=args.context, max_batch=args.batch, attention=args.attention,
+                fuse_projections=args.fuse_projections) as engine:
+        sample = Sampling(max_tokens=args.max_new, exit_threshold=args.exit_threshold)
+        results = []
+        for start in range(0, len(prompts), args.batch):
+            tokenized = [tokenizer.encode(text, add_special_tokens=False) for text in prompts[start:start + args.batch]]
+            results.extend(engine.generate(tokenized, sample))
     elapsed = time.perf_counter() - started
 
     rows = []
@@ -90,6 +98,15 @@ def run_loopinfer(items, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", choices=["hf", "loopinfer"], required=True)
+    parser.add_argument("--model", default=str(MODEL))
+    parser.add_argument("--revision")
+    parser.add_argument("--data", type=Path, default=GSM8K)
+    parser.add_argument("--context", type=int, default=2048)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16")
+    parser.add_argument("--attention", choices=("sdpa", "flashinfer"), default="sdpa")
+    parser.add_argument("--fuse-projections", action="store_true")
+    parser.add_argument("--exit-threshold", type=float)
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--max-new", type=int, default=192)
     parser.add_argument("--batch", type=int, default=4)
@@ -98,11 +115,14 @@ def main():
     parser.add_argument("--out", type=Path, default=RESULTS / "accuracy")
     args = parser.parse_args()
 
-    items = load_gsm8k(args.count, seed=args.seed)
+    if min(args.count, args.batch, args.max_new) < 1:
+        parser.error("count, batch and max-new must be positive")
+    items = load_gsm8k(args.count, seed=args.seed, path=args.data)
     runner = run_hf if args.engine == "hf" else run_loopinfer
     rows, elapsed = runner(items, args)
     summary = summarise(rows, elapsed, args.max_new)
-    summary.update({"seed": args.seed, "batch": args.batch, "loops": args.loops})
+    summary.update({"seed": args.seed, "batch": args.batch, "loops": args.loops, "model": args.model, "revision": args.revision,
+                    "dtype": args.dtype, "exit_threshold": args.exit_threshold})
 
     args.out.mkdir(parents=True, exist_ok=True)
     with (args.out / f"gsm8k_{args.engine}.jsonl").open("w", encoding="utf-8") as handle:
